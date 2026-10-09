@@ -560,7 +560,32 @@ heartbeat every 5 seconds. The dashboard Nodes tab shows live sensor
 status, gain/squelch controls, and packet rate monitoring.
 
 Runtime-tunable: SDR gain, squelch threshold.
-Restart-required: center frequency, channel count (sensor restarts automatically).
+Restart-required: center frequency, channel count. The dashboard sends a
+restart request; the current Rust sensor logs it but does not restart.
+
+Dashboard POST clients must send `Content-Type: application/json` (charset
+parameters are accepted). For example, request status for a known sensor:
+
+    curl -H 'Content-Type: application/json' \
+      -d '{"sensor_id":"sensor-example"}' \
+      http://localhost:8099/api/c2/get_status
+
+Plain `curl -d` defaults to form encoding and receives HTTP 415. Malformed
+JSON, non-object bodies and invalid control fields receive HTTP 400 with a
+JSON `{ "ok": false, "error": "..." }` body.
+The JSON requirement, together with refusing cross-origin JSON preflight,
+protects browser controls on plain sensor-IP HTTP too. `Sec-Fetch-Site`
+rejection is supplemental: browsers normally omit Fetch Metadata on ordinary
+LAN HTTP, as described in the [Fetch Metadata specification](https://w3c.github.io/webappsec-fetch-metadata/#integration).
+Reverse proxies may rewrite Host; no Origin-to-Host equality is required.
+Do not add cross-origin CORS for these controls without revisiting this rule.
+This is not authentication or DNS-rebinding protection; deploy the externally
+bound dashboard only where intended clients can reach it.
+
+RF names and sensor IDs are escaped in device details, Nodes and map labels.
+Device-name map tooltips require GPS/positioned sensors, reported TX power
+and privacy display disabled. Sensor labels and C2-derived strings can appear
+in Nodes and map markers independently of that device-tooltip combination.
 
 #### CURVE Encryption
 

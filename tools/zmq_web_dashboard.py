@@ -2236,6 +2236,10 @@ state = DashboardState()
 gps_enabled = False
 
 
+class InvalidRequest(ValueError):
+    """A deliberate validation error safe to return to an API client."""
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
@@ -2263,29 +2267,70 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _read_post_body(self, max_bytes=65536):
         length = int(self.headers.get("Content-Length", 0))
         if length <= 0:
-            return {}
+            raise ValueError("JSON object required")
         if length > max_bytes:
             return None
-        return _load_json(self.rfile.read(length))
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            raise ValueError("incomplete request body")
+        body = _load_json(raw)
+        if not isinstance(body, dict):
+            raise ValueError("JSON object required")
+        return body
+
+    @staticmethod
+    def _number(field, value, low, high, integer=False):
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise InvalidRequest(f"{field} must be a number")
+        try:
+            number = float(value)
+        except (ValueError, OverflowError):
+            raise InvalidRequest(f"{field} must be a finite number") from None
+        if not math.isfinite(number) or not low <= number <= high:
+            raise InvalidRequest(f"{field} out of range ({low} to {high})")
+        if integer:
+            if number != int(number):
+                raise InvalidRequest(f"{field} must be an integer")
+            return int(number)
+        return number
 
     def do_POST(self):
+        # JSON requests require preflight across origins. Do not enable CORS
+        # for these controls without revisiting CSRF protection.
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            self.send_error(415, "Content-Type must be application/json")
+            return
+        # Supplemental only: ordinary LAN HTTP may omit Fetch Metadata.
+        if self.headers.get("Sec-Fetch-Site", "").lower() in ("cross-site", "same-site"):
+            self.send_error(403)
+            return
+        try:
+            self._dispatch_post()
+        except InvalidRequest as error:
+            self._invalid_request(str(error))
+        except (ValueError, TypeError, AttributeError, OverflowError, RecursionError):
+            self._invalid_request()
+
+    def _dispatch_post(self):
         path = urlparse(self.path).path
         if path == "/api/watch":
-            try:
-                body = self._read_post_body()
-                if body is None:
-                    self.send_error(413)
-                    return
-                mac = body.get("mac", "")
-                watch = body.get("watch", False)
-                if state.alert_mgr:
-                    if watch:
-                        state.alert_mgr.watch_set.add(mac.lower())
-                    else:
-                        state.alert_mgr.watch_set.discard(mac.lower())
-                self._serve_json({"ok": True})
-            except Exception:
-                self.send_error(400)
+            body = self._read_post_body()
+            if body is None:
+                self.send_error(413)
+                return
+            mac = body.get("mac", "")
+            watch = body.get("watch", False)
+            if not isinstance(mac, str) or not mac:
+                raise InvalidRequest("mac must be a nonempty string")
+            if not isinstance(watch, bool):
+                raise InvalidRequest("watch must be a boolean")
+            if state.alert_mgr:
+                if watch:
+                    state.alert_mgr.watch_set.add(mac.lower())
+                else:
+                    state.alert_mgr.watch_set.discard(mac.lower())
+            self._serve_json({"ok": True})
         elif path == "/api/gatt/query":
             self._handle_gatt_query()
         elif path == "/api/gatt/write":
@@ -2302,12 +2347,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_error(413)
                 return
         except Exception:
-            self.send_error(400)
+            self._invalid_request()
             return
 
         mac = body.get("mac", "").lower()
-        if not mac:
-            self._serve_json({"ok": False, "error": "mac required"})
+        if not _valid_bd_addr(mac):
+            self._invalid_request("valid mac required")
             return
 
         # Only send to sensors that have actually seen this device
@@ -2337,7 +2382,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_error(413)
                 return
         except Exception:
-            self.send_error(400)
+            self._invalid_request()
             return
 
         mac = body.get("mac", "").lower()
@@ -2345,15 +2390,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         data_hex = body.get("data", "")
         service_uuid = body.get("service_uuid")  # optional
 
-        if not mac or not char_uuid or not data_hex:
-            self._serve_json({"ok": False, "error": "mac, char_uuid, and data (hex) required"})
+        if (not _valid_bd_addr(mac) or not isinstance(char_uuid, str) or not char_uuid
+                or not isinstance(data_hex, str) or not data_hex
+                or (service_uuid is not None and not isinstance(service_uuid, str))):
+            self._invalid_request("valid mac, char_uuid, and data (hex) required")
             return
 
         # Validate hex data
         try:
             bytes.fromhex(data_hex.replace(" ", ""))
         except ValueError:
-            self._serve_json({"ok": False, "error": "invalid hex in data field"})
+            self._invalid_request("invalid hex in data field")
             return
 
         with state.lock:
@@ -2389,57 +2436,39 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_error(413)
                 return
         except Exception:
-            self.send_error(400)
+            self._invalid_request()
             return
 
         sensor_id = body.get("sensor_id", "")
-        if not sensor_id:
-            self._serve_json({"ok": False, "error": "sensor_id required"})
+        if not isinstance(sensor_id, str) or not sensor_id:
+            self._invalid_request("sensor_id required")
             return
 
         if path == "/api/c2/set_gain":
             params = {}
             if "gain" in body:
-                g = float(body["gain"])
-                if not (0 <= g <= 100):
-                    self._serve_json({"ok": False, "error": "gain out of range (0-100)"})
-                    return
+                g = self._number("gain", body["gain"], 0, 100)
                 params["gain"] = g
             if "lna" in body:
-                v = int(body["lna"])
-                if not (0 <= v <= 40):
-                    self._serve_json({"ok": False, "error": "lna out of range (0-40)"})
-                    return
+                v = self._number("lna", body["lna"], 0, 40, integer=True)
                 params["lna"] = v
             if "vga" in body:
-                v = int(body["vga"])
-                if not (0 <= v <= 62):
-                    self._serve_json({"ok": False, "error": "vga out of range (0-62)"})
-                    return
+                v = self._number("vga", body["vga"], 0, 62, integer=True)
                 params["vga"] = v
             state.send_c2_command(sensor_id, "set_gain", params)
             self._serve_json({"ok": True})
         elif path == "/api/c2/set_squelch":
-            threshold = float(body.get("threshold", -45))
-            if not (-100 <= threshold <= -5):
-                self._serve_json({"ok": False, "error": "threshold out of range (-100 to -5)"})
-                return
+            threshold = self._number("threshold", body.get("threshold", -45), -100, -5)
             state.send_c2_command(sensor_id, "set_squelch",
                                   {"threshold": threshold})
             self._serve_json({"ok": True})
         elif path == "/api/c2/restart":
             params = {}
             if "center_freq" in body:
-                f = int(body["center_freq"])
-                if not (2400 <= f <= 2500):
-                    self._serve_json({"ok": False, "error": "center_freq out of range (2400-2500 MHz)"})
-                    return
+                f = self._number("center_freq", body["center_freq"], 2400, 2500, integer=True)
                 params["center_freq"] = f
             if "channels" in body:
-                c = int(body["channels"])
-                if not (1 <= c <= 96):
-                    self._serve_json({"ok": False, "error": "channels out of range (1-96)"})
-                    return
+                c = self._number("channels", body["channels"], 1, 96, integer=True)
                 params["channels"] = c
             state.send_c2_command(sensor_id, "restart", params)
             self._serve_json({"ok": True})
@@ -2450,22 +2479,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
             params = {
                 "name": body.get("name", "BlueDragon"),
                 "connectable": body.get("connectable", False),
-                "duration": body.get("duration", 30),
+                "duration": self._number("duration", body.get("duration", 30), 0, 0xFFFFFFFF, integer=True),
             }
+            if not isinstance(params["name"], str):
+                raise InvalidRequest("name must be a string")
+            if not isinstance(params["connectable"], bool):
+                raise InvalidRequest("connectable must be a boolean")
+            if not _string_list(body.get("service_uuids", [])):
+                raise InvalidRequest("service_uuids must be a list of strings")
             if body.get("service_uuids"):
                 params["service_uuids"] = body["service_uuids"]
             state.send_c2_command(sensor_id, "spoof_adv", params)
             self._serve_json({"ok": True, "message": f"spoof_adv sent to {sensor_id}"})
         elif path == "/api/c2/l2cap_flood":
             mac = body.get("mac")
-            if not mac:
-                self._serve_json({"ok": False, "error": "mac required"})
+            if not _valid_bd_addr(mac):
+                self._invalid_request("valid mac required")
                 return
             params = {
                 "mac": mac,
-                "count": body.get("count", 10),
-                "hold_secs": body.get("hold_secs", 30),
-                "psm": body.get("psm", 0),
+                "count": self._number("count", body.get("count", 10), 0, 0xFFFFFFFF, integer=True),
+                "hold_secs": self._number("hold_secs", body.get("hold_secs", 30), 0, 0xFFFFFFFF, integer=True),
+                "psm": self._number("psm", body.get("psm", 0), 0, 0xFFFF, integer=True),
             }
             state.send_c2_command(sensor_id, "l2cap_flood", params)
             self._serve_json({"ok": True, "message": f"l2cap_flood sent to {sensor_id}"})
@@ -2479,8 +2514,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         html = DASHBOARD_HTML.replace("__GPS_ENABLED__", "true" if gps_enabled else "false")
         self.wfile.write(html.encode())
 
-    def _serve_json(self, data):
-        self.send_response(200)
+    def _invalid_request(self, message="invalid request body or fields"):
+        self._serve_json({"ok": False, "error": message}, status=400)
+
+    def _serve_json(self, data, status=200):
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
@@ -3450,10 +3488,16 @@ function fmtUp(s) {
 }
 
 function esc(s) {
-  if (!s) return '';
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
+}
+
+function validMac(mac) {
+  return typeof mac === 'string' && /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/i.test(mac);
+}
+
+function validUuid(uuid) {
+  return typeof uuid === 'string' && /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(uuid);
 }
 
 function ago(ts) {
@@ -3553,9 +3597,6 @@ function btMacLabel(d) {
     const uap = ('0'+d.uap.toString(16)).slice(-2);
     return d.mac.replace('bt:', 'bt:'+uap+':');
   }
-  if (d.uap_conf != null && d.uap_conf === 0 && d.pkts > 0) {
-    return d.mac + ' <span class="dim" style="font-size:9px">(UAP?)</span>';
-  }
   return d.mac;
 }
 
@@ -3636,8 +3677,11 @@ function renderDevices() {
         if (!priv && d.rpa_count > 1) mc += ' ('+d.rpa_count+' addrs)';
       }
     }
+    mc = esc(mc);
+    if (proto === 'BT' && !priv && d.uap == null && d.uap_conf === 0 && d.pkts > 0)
+      mc += ' <span class="dim" style="font-size:9px">(UAP?)</span>';
     if (d.is_new) mc += ' <span style="color:#f55;font-size:9px;font-weight:bold">NEW</span>';
-    const dist = d.est_dist != null ? '~'+d.est_dist+'m' : '';
+    const dist = d.est_dist != null ? '~'+esc(d.est_dist)+'m' : '';
     const total = d.crc_ok + d.crc_bad;
     const crcPct = total > 0 ? Math.round(100*d.crc_ok/total)+'%' : '-';
     const crcCls = total > 0 ? (d.crc_ok/total > 0.8 ? 'grn' : d.crc_ok/total > 0.4 ? 'yel' : 'red') : 'dim';
@@ -3647,20 +3691,21 @@ function renderDevices() {
       `<td class="dim">${ago(d.last)}</td>`+
       `<td>${connBadge}${protoBadge(proto)}</td>`+
       `<td class="${macCls}">${mc}</td>`+
-      `<td class="${addrCls(mt)}">${mt}</td>`+
+      `<td class="${addrCls(mt)}">${esc(mt)}</td>`+
       `<td>${esc(mfrLabel(d))}</td>`+
       `<td class="blu">${priv ? maskName(d.name) : esc(d.name)}</td>`+
       `<td class="dim">${esc(svcLabel(d))}</td>`+
-      `<td class="${isAdv?'blu':'org'}">${d.type}</td>`+
-      `<td class="${d.phy!=='1M'?'org':'dim'}">${d.phy||'1M'}</td>`+
-      `<td class="dim">${chLabel(d)}</td>`+
-      `<td>${rssiLabel(d)}</td>`+
-      `<td class="dim">${dist}</td>`+
-      `<td class="dim">${d.num_sensors||''}</td>`+
-      `<td class="count">${d.pkts.toLocaleString()}</td>`+
+      `<td class="${isAdv?'blu':'org'}">${esc(d.type)}</td>`+
+      `<td class="${d.phy!=='1M'?'org':'dim'}">${esc(d.phy||'1M')}</td>`+
+      `<td class="dim">${esc(chLabel(d))}</td>`+
+      `<td>${esc(rssiLabel(d))}</td>`+
+      `<td class="dim">${esc(dist)}</td>`+
+      `<td class="dim">${esc(d.num_sensors||'')}</td>`+
+      `<td class="count">${esc(d.pkts.toLocaleString())}</td>`+
       `<td class="${crcCls}">${crcPct}</td>`+
       `<td class="dim">${fmtT(d.first)}</td>`+
-      `<td><button onclick="toggleWatch('${d.mac.replace(/'/g,"\\'")}')" style="font-size:9px;padding:1px 5px;cursor:pointer;background:${watched.has(d.mac)?'#754':'#333'};color:#ccc;border:1px solid #555;border-radius:3px">${watched.has(d.mac)?'unwatch':'watch'}</button></td>`;
+      `<td><button class="watch-btn" style="font-size:9px;padding:1px 5px;cursor:pointer;background:${watched.has(d.mac)?'#754':'#333'};color:#ccc;border:1px solid #555;border-radius:3px">${watched.has(d.mac)?'unwatch':'watch'}</button></td>`;
+    tr.querySelector('.watch-btn').addEventListener('click', () => toggleWatch(d.mac));
     frag.appendChild(tr);
   }
   tb.innerHTML = '';
@@ -3770,8 +3815,8 @@ function updStats(s) {
 }
 
 /* --- Multi-sensor map markers --- */
-let sensorMarkers = {};
-let deviceMarkers = {};
+let sensorMarkers = Object.create(null);
+let deviceMarkers = Object.create(null);
 
 function updateSensors(sensors) {
   if (!map) return;
@@ -3780,16 +3825,16 @@ function updateSensors(sensors) {
     if (sensorMarkers[s.id]) {
       sensorMarkers[s.id].setLatLng([s.lat, s.lon]);
       sensorMarkers[s.id].unbindTooltip();
-      sensorMarkers[s.id].bindTooltip(s.id+' ('+s.pkts.toLocaleString()+' pkts)');
+      sensorMarkers[s.id].bindTooltip(esc(s.id)+' ('+esc(s.pkts.toLocaleString())+' pkts)');
     } else {
       const m = L.marker([s.lat, s.lon], {
         icon: L.divIcon({
           className: '',
-          html: '<div style="background:#f80;color:#000;padding:2px 6px;border-radius:3px;font:bold 10px monospace;white-space:nowrap;border:1px solid #a50">'+s.id+'</div>',
+          html: '<div style="background:#f80;color:#000;padding:2px 6px;border-radius:3px;font:bold 10px monospace;white-space:nowrap;border:1px solid #a50">'+esc(s.id)+'</div>',
           iconSize: null, iconAnchor: [0, 0]
         })
       }).addTo(map);
-      m.bindTooltip(s.id+' ('+s.pkts.toLocaleString()+' pkts)');
+      m.bindTooltip(esc(s.id)+' ('+esc(s.pkts.toLocaleString())+' pkts)');
       sensorMarkers[s.id] = m;
       map.setView([s.lat, s.lon], 15);
     }
@@ -3807,7 +3852,7 @@ function updateDevicePositions(devs) {
     let color = d.num_sensors >= 3 ? '#4c4' : d.num_sensors === 2 ? '#cc4' : '#c44';
     const unc = d.est_unc || 50;
     const label = priv ? 'device' : (d.name || d.mac);
-    const tip = label+' ~'+(d.est_dist||'?')+'m, '+d.num_sensors+' sensor'+(d.num_sensors!==1?'s':'');
+    const tip = esc(label+' ~'+(d.est_dist||'?')+'m, '+d.num_sensors+' sensor'+(d.num_sensors!==1?'s':''));
     if (deviceMarkers[key]) {
       deviceMarkers[key].dot.setLatLng([d.est_lat, d.est_lon]);
       deviceMarkers[key].ring.setLatLng([d.est_lat, d.est_lon]);
@@ -3900,13 +3945,13 @@ function c2SetSquelch(sensorId, val) {
   c2Post('/api/c2/set_squelch', {sensor_id: sensorId, threshold: parseFloat(val)});
 }
 
-function c2Restart(sensorId) {
-  const freqEl = document.getElementById('restart-freq-'+sensorId);
-  const chEl = document.getElementById('restart-ch-'+sensorId);
+function c2Restart(sensorId, row) {
+  const freqEl = row.querySelector('.restart-freq');
+  const chEl = row.querySelector('.restart-ch');
   const params = {sensor_id: sensorId};
   if (freqEl && freqEl.value) params.center_freq = parseInt(freqEl.value);
   if (chEl && chEl.value) params.channels = parseInt(chEl.value);
-  if (!confirm('Restart sensor "'+sensorId+'"? This will briefly disconnect it.')) return;
+  if (!confirm('Send restart request to sensor "'+sensorId+'"?')) return;
   c2Post('/api/c2/restart', params);
 }
 
@@ -3927,6 +3972,9 @@ function renderNodes() {
   if (!nodesData.length) { ntb.innerHTML = ''; empty.style.display = 'block'; return; }
   empty.style.display = 'none';
   const frag = document.createDocumentFragment();
+  const slider = (kind, value, low, high, step) =>
+    '<input type="range" data-control="'+kind+'" min="'+low+'" max="'+high+'" step="'+step+'" value="'+esc(value)+'">' +
+    '<span class="val-label">'+esc(value)+'</span>';
   for (const n of nodesData) {
     const tr = document.createElement('tr');
     const dotCls = n.status === 'online' ? 'dot-online' : n.status === 'stale' ? 'dot-stale' : 'dot-offline';
@@ -3936,53 +3984,32 @@ function renderNodes() {
     const up = n.uptime != null ? fmtUp(n.uptime) : '-';
     let gainHtml = '-';
     if (n.has_c2 && n.gain != null) {
-      const sid = n.id.replace(/[^a-zA-Z0-9_-]/g,'_');
       if (n.sdr === 'hackrf' && n.gain.lna != null) {
-        gainHtml = '<div class="node-ctrl">' +
-          'LNA <input type="range" min="0" max="40" step="8" value="'+n.gain.lna+'" ' +
-          'oninput="sliderPreview(this,\'gl-'+sid+'\')" ' +
-          'onmousedown="nodesDragging=true" ontouchstart="nodesDragging=true" ' +
-          'onchange="nodesDragging=false;c2SetGain(\''+n.id+'\',\'hackrf\',this.value,\'lna\')">' +
-          '<span class="val-label" id="gl-'+sid+'">'+n.gain.lna+'</span>' +
-          'VGA <input type="range" min="0" max="62" step="2" value="'+n.gain.vga+'" ' +
-          'oninput="sliderPreview(this,\'gv-'+sid+'\')" ' +
-          'onmousedown="nodesDragging=true" ontouchstart="nodesDragging=true" ' +
-          'onchange="nodesDragging=false;c2SetGain(\''+n.id+'\',\'hackrf\',this.value,\'vga\')">' +
-          '<span class="val-label" id="gv-'+sid+'">'+n.gain.vga+'</span></div>';
+        gainHtml = '<div class="node-ctrl">LNA ' + slider('lna', n.gain.lna, 0, 40, 8) +
+          'VGA ' + slider('vga', n.gain.vga, 0, 62, 2) + '</div>';
       } else {
         const gv = n.gain.value != null ? n.gain.value : n.gain;
-        gainHtml = '<div class="node-ctrl">' +
-          '<input type="range" min="0" max="76" step="1" value="'+gv+'" ' +
-          'oninput="sliderPreview(this)" ' +
-          'onmousedown="nodesDragging=true" ontouchstart="nodesDragging=true" ' +
-          'onchange="nodesDragging=false;c2SetGain(\''+n.id+'\',\''+n.sdr+'\',this.value,\'gain\')">' +
-          '<span class="val-label">'+gv+'</span></div>';
+        gainHtml = '<div class="node-ctrl">' + slider('gain', gv, 0, 76, 1) + '</div>';
       }
     }
     let sqlHtml = '-';
     if (n.has_c2 && n.squelch != null) {
-      sqlHtml = '<div class="node-ctrl">' +
-        '<input type="range" min="-80" max="-10" step="1" value="'+n.squelch+'" ' +
-        'oninput="sliderPreview(this)" ' +
-        'onmousedown="nodesDragging=true" ontouchstart="nodesDragging=true" ' +
-        'onchange="nodesDragging=false;c2SetSquelch(\''+n.id+'\',this.value)">' +
-        '<span class="val-label">'+n.squelch+'</span></div>';
+      sqlHtml = '<div class="node-ctrl">' + slider('squelch', n.squelch, -80, -10, 1) + '</div>';
     }
     let ctrlHtml = '';
     if (n.has_c2) {
-      const sid = n.id.replace(/[^a-zA-Z0-9_-]/g,'_');
       ctrlHtml = '<div class="node-ctrl">' +
-        '<input type="number" id="restart-freq-'+sid+'" placeholder="freq" value="'+(n.center_freq||'')+'" style="width:55px" onfocus="nodesDragging=true" onblur="nodesDragging=false">' +
-        '<input type="number" id="restart-ch-'+sid+'" placeholder="ch" value="'+(n.channels||'')+'" style="width:40px" onfocus="nodesDragging=true" onblur="nodesDragging=false">' +
-        '<button onclick="c2Restart(\''+n.id+'\')" style="color:#f88">restart</button>' +
-        '<button onclick="c2GetStatus(\''+n.id+'\')">refresh</button></div>';
+        '<input type="number" class="restart-freq" placeholder="freq" value="'+esc(n.center_freq||'')+'" style="width:55px">' +
+        '<input type="number" class="restart-ch" placeholder="ch" value="'+esc(n.channels||'')+'" style="width:40px">' +
+        '<button class="restart-btn" style="color:#f88">restart</button>' +
+        '<button class="status-btn">refresh</button></div>';
     }
     tr.innerHTML =
       '<td><span class="dot '+dotCls+'"></span>'+esc(n.status)+'</td>' +
       '<td>'+esc(n.id)+'</td>' +
       '<td>'+esc(n.sdr||'-')+'</td>' +
-      '<td>'+(n.center_freq||'-')+'</td>' +
-      '<td>'+(n.channels||'-')+'</td>' +
+      '<td>'+esc(n.center_freq||'-')+'</td>' +
+      '<td>'+esc(n.channels||'-')+'</td>' +
       '<td>'+gainHtml+'</td>' +
       '<td>'+sqlHtml+'</td>' +
       '<td>'+rate+'</td>' +
@@ -3990,6 +4017,24 @@ function renderNodes() {
       '<td>'+up+'</td>' +
       '<td class="dim">'+gps+'</td>' +
       '<td>'+ctrlHtml+'</td>';
+    tr.querySelectorAll('input').forEach(input => {
+      input.addEventListener('pointerdown', () => { nodesDragging = true; });
+      input.addEventListener('focus', () => { nodesDragging = true; });
+      input.addEventListener('blur', () => { nodesDragging = false; });
+    });
+    tr.querySelectorAll('input[type="range"]').forEach(input => {
+      input.addEventListener('input', () => sliderPreview(input));
+      input.addEventListener('change', () => {
+        nodesDragging = false;
+        const kind = input.dataset.control;
+        if (kind === 'squelch') c2SetSquelch(n.id, input.value);
+        else c2SetGain(n.id, n.sdr, input.value, kind);
+      });
+    });
+    if (n.has_c2) {
+      tr.querySelector('.restart-btn').addEventListener('click', () => c2Restart(n.id, tr));
+      tr.querySelector('.status-btn').addEventListener('click', () => c2GetStatus(n.id));
+    }
     frag.appendChild(tr);
   }
   ntb.innerHTML = '';
@@ -4011,10 +4056,10 @@ function renderConnections() {
       '<td>'+esc(c.init_addr)+'</td>' +
       '<td>'+esc(c.adv_addr)+'</td>' +
       '<td class="dim">'+esc(c.aa)+'</td>' +
-      '<td>'+c.interval_ms+'ms</td>' +
-      '<td>'+c.hop+'</td>' +
-      '<td>'+c.used_channels+'/37</td>' +
-      '<td class="count">'+c.data_pkts.toLocaleString()+'</td>' +
+      '<td>'+esc(c.interval_ms)+'ms</td>' +
+      '<td>'+esc(c.hop)+'</td>' +
+      '<td>'+esc(c.used_channels)+'/37</td>' +
+      '<td class="count">'+esc(c.data_pkts.toLocaleString())+'</td>' +
       '<td class="dim">'+ageStr+'</td>';
     frag.appendChild(tr);
   }
@@ -4024,7 +4069,7 @@ function renderConnections() {
 
 /* --- Device detail panel --- */
 let detailMac = null;
-let gattPending = {};
+let gattPending = Object.create(null);
 
 function openDetail(d) {
   detailMac = d.mac;
@@ -4051,15 +4096,15 @@ function renderDetail(d) {
   html += '<div class="detail-row"><span class="lbl">Addr type</span><span class="val ' + addrCls(d.mac_type||'') + '">' + esc(d.mac_type||'-') + '</span></div>';
   html += '<div class="detail-row"><span class="lbl">Connectable</span><span class="val">' + connLabel + '</span></div>';
   html += '<div class="detail-row"><span class="lbl">RSSI</span><span class="val">' + rssiLabel(d) + ' dBm</span></div>';
-  if (d.tx_pwr != null) html += '<div class="detail-row"><span class="lbl">TX power</span><span class="val">' + d.tx_pwr + ' dBm</span></div>';
-  if (d.est_dist != null) html += '<div class="detail-row"><span class="lbl">Est. dist</span><span class="val">~' + d.est_dist + ' m</span></div>';
+  if (d.tx_pwr != null) html += '<div class="detail-row"><span class="lbl">TX power</span><span class="val">' + esc(d.tx_pwr) + ' dBm</span></div>';
+  if (d.est_dist != null) html += '<div class="detail-row"><span class="lbl">Est. dist</span><span class="val">~' + esc(d.est_dist) + ' m</span></div>';
   html += '<div class="detail-row"><span class="lbl">Packets</span><span class="val">' + d.pkts.toLocaleString() + '</span></div>';
   html += '<div class="detail-row"><span class="lbl">CRC</span><span class="val">' + crcPct + ' (' + d.crc_ok + ' ok, ' + d.crc_bad + ' bad)</span></div>';
   html += '<div class="detail-row"><span class="lbl">PDU type</span><span class="val">' + esc(d.type) + '</span></div>';
   html += '<div class="detail-row"><span class="lbl">PHY</span><span class="val">' + esc(d.phy||'1M') + '</span></div>';
   html += '<div class="detail-row"><span class="lbl">First seen</span><span class="val">' + fmtT(d.first) + '</span></div>';
   html += '<div class="detail-row"><span class="lbl">Last seen</span><span class="val">' + ago(d.last) + '</span></div>';
-  if (d.num_sensors > 0) html += '<div class="detail-row"><span class="lbl">Sensors</span><span class="val">' + d.num_sensors + (d.sensor_ids ? ' (' + d.sensor_ids.join(', ') + ')' : '') + '</span></div>';
+  if (d.num_sensors > 0) html += '<div class="detail-row"><span class="lbl">Sensors</span><span class="val">' + d.num_sensors + (d.sensor_ids ? ' (' + esc(d.sensor_ids.join(', ')) + ')' : '') + '</span></div>';
 
   // Apple Continuity decoded fields
   if (d.apple_action) html += '<div class="detail-row"><span class="lbl">Activity</span><span class="val">' + esc(d.apple_action) + '</span></div>';
@@ -4068,11 +4113,11 @@ function renderDetail(d) {
   if (d.apple_model) html += '<div class="detail-row"><span class="lbl">Model</span><span class="val">' + esc(d.apple_model) + '</span></div>';
   if (d.apple_battery) html += '<div class="detail-row"><span class="lbl">Battery</span><span class="val">' + esc(d.apple_battery) + '</span></div>';
   if (d.apple_nearby_action) html += '<div class="detail-row"><span class="lbl">Nearby action</span><span class="val">' + esc(d.apple_nearby_action) + '</span></div>';
-  if (d.apple_tether_battery != null) html += '<div class="detail-row"><span class="lbl">Hotspot battery</span><span class="val">' + d.apple_tether_battery + '%</span></div>';
+  if (d.apple_tether_battery != null) html += '<div class="detail-row"><span class="lbl">Hotspot battery</span><span class="val">' + esc(d.apple_tether_battery) + '%</span></div>';
   if (d.find_my) html += '<div class="detail-row"><span class="lbl">Find My</span><span class="val" style="color:#f55">' + (d.find_my_maintained ? 'Tracker (maintained)' : 'Tracker detected') + '</span></div>';
   if (d.airplay_ip) html += '<div class="detail-row"><span class="lbl">AirPlay IP</span><span class="val">' + esc(d.airplay_ip) + '</span></div>';
   if (d.ibeacon_uuid) html += '<div class="detail-row"><span class="lbl">iBeacon UUID</span><span class="val" style="font-size:9px">' + esc(d.ibeacon_uuid) + '</span></div>';
-  if (d.ibeacon_major != null) html += '<div class="detail-row"><span class="lbl">iBeacon Major/Minor</span><span class="val">' + d.ibeacon_major + ' / ' + d.ibeacon_minor + '</span></div>';
+  if (d.ibeacon_major != null) html += '<div class="detail-row"><span class="lbl">iBeacon Major/Minor</span><span class="val">' + esc(d.ibeacon_major) + ' / ' + esc(d.ibeacon_minor) + '</span></div>';
   // Microsoft CDP fields
   if (d.ms_device_type) html += '<div class="detail-row"><span class="lbl">Device type</span><span class="val">' + esc(d.ms_device_type) + '</span></div>';
   if (d.ms_device_status) html += '<div class="detail-row"><span class="lbl">MS status</span><span class="val">' + esc(d.ms_device_status) + '</span></div>';
@@ -4095,14 +4140,20 @@ function renderDetail(d) {
   } else {
     html += '<div class="dim" style="font-size:10px">No GATT data available.</div>';
   }
-  if (d.connectable) {
+  if (d.connectable && validMac(d.mac)) {
     const btnDisabled = gattPending[d.mac] ? ' disabled' : '';
     const btnLabel = gattPending[d.mac] ? 'querying...' : (d.gatt ? 'refresh GATT' : 'query GATT');
-    html += '<button class="gatt-btn"' + btnDisabled + ' onclick="queryGatt(\'' + d.mac.replace(/'/g,"\\'") + '\')">' + btnLabel + '</button>';
+    html += '<button class="gatt-btn"' + btnDisabled + '>' + btnLabel + '</button>';
   }
   html += '</div>';
 
   el.innerHTML = html;
+  const query = el.querySelector('.gatt-btn');
+  if (query) query.addEventListener('click', () => queryGatt(d.mac));
+  el.querySelectorAll('.gatt-write-btn').forEach(button => {
+    button.addEventListener('click', () => writeGattPrompt(
+      button.dataset.mac, button.dataset.char, button.dataset.service));
+  });
 }
 
 function renderGattResult(g) {
@@ -4125,14 +4176,15 @@ function renderGattResult(g) {
     for (const ch of chars) {
       html += '<div class="gatt-char">';
       html += '<span class="gatt-char-uuid">' + esc(ch.uuid) + '</span>';
-      if (ch.flags && ch.flags.length) html += '<span class="gatt-char-flags">[' + ch.flags.join(', ') + ']</span>';
+      if (ch.flags && ch.flags.length) html += '<span class="gatt-char-flags">[' + esc(ch.flags.join(', ')) + ']</span>';
       if (ch.value_str) html += '<div class="gatt-char-val">"' + esc(ch.value_str) + '"</div>';
       else if (ch.value) html += '<div class="gatt-char-val">' + esc(ch.value) + '</div>';
-      if (ch.flags && (ch.flags.includes('write') || ch.flags.includes('write-without-response'))) {
-        const cm = g.mac.replace(/'/g,"\\'");
-        const cu = ch.uuid.replace(/'/g,"\\'");
-        const su = svc.uuid.replace(/'/g,"\\'");
-        html += '<button style="font-size:8px;padding:1px 4px;margin:1px 0;cursor:pointer;background:#543;color:#ccc;border:1px solid #765;border-radius:2px" onclick="writeGattPrompt(\'' + cm + '\',\'' + cu + '\',\'' + su + '\')">write</button>';
+      if (validMac(g.mac) && validUuid(ch.uuid) && validUuid(svc.uuid) &&
+          ch.flags && (ch.flags.includes('write') || ch.flags.includes('write-without-response'))) {
+        const cm = esc(g.mac);
+        const cu = esc(ch.uuid);
+        const su = esc(svc.uuid);
+        html += '<button class="gatt-write-btn" data-mac="'+cm+'" data-char="'+cu+'" data-service="'+su+'" style="font-size:8px;padding:1px 4px;margin:1px 0;cursor:pointer;background:#543;color:#ccc;border:1px solid #765;border-radius:2px">write</button>';
       }
       html += '</div>';
     }

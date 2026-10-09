@@ -187,6 +187,20 @@
 - [ ] Verify malformed then valid messages over live ZMQ sockets with a
   validation dashboard using `--no-db`. Mocked sockets do not qualify this.
 
+### Request and Browser Validation
+
+- [ ] Every upstream POST route rejects malformed/non-object bodies and invalid
+      numeric fields with HTTP 400, with command dispatch stubbed.
+- [ ] JSON with charset works; form/plain POSTs get 415; rewritten proxy Host
+      works; cross-origin JSON preflight authorizes no request.
+- [ ] On untrustworthy HTTP, header-absent same-origin JSON works, simple
+      cross-origin POSTs fail and JSON preflight queues no command.
+- [ ] Fetch Metadata rejects cross-site/same-site separately from LAN HTTP.
+- [ ] Real browser DOM renders hostile RF/sensor labels as text in map, Nodes
+      and detail views; watch, gain/squelch, restart and GATT query still work
+      against stub sensors with `--no-db`.
+- [ ] Live sensor deployment qualification.
+
 ---
 
 ## Cross-Device Loopback Tests (Verified)
