@@ -40,6 +40,7 @@ import json
 import math
 import os
 import queue
+import re
 import signal
 import sqlite3
 import struct
@@ -58,6 +59,19 @@ try:
 except ImportError:
     print("pyzmq is required: pip install pyzmq", file=sys.stderr)
     sys.exit(1)
+
+def _json_number(value):
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("non-finite JSON number")
+    return number
+
+
+def _load_json(payload):
+    # Check every number, including unknown nested fields and float overflow,
+    # before retained messages can make the browser's JSON.parse fail.
+    return json.loads(payload, parse_constant=_json_number, parse_float=_json_number)
+
 
 # ---------------------------------------------------------------------------
 # SQLite device persistence
@@ -2252,7 +2266,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return {}
         if length > max_bytes:
             return None
-        return json.loads(self.rfile.read(length))
+        return _load_json(self.rfile.read(length))
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -2631,6 +2645,115 @@ def _process_zmq_message(frames, pcap_file, use_gps, fallback_sensor_id=None):
         state.add_packet(pkt, gps_info, sensor_id)
 
 
+def _valid_bd_addr(value):
+    return isinstance(value, str) and re.fullmatch(
+        r"[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}", value) is not None
+
+
+def _finite_number(value):
+    try:
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value))
+    except OverflowError:
+        return False
+
+
+def _optional_fields(message, names, predicate):
+    return all(message.get(name) is None or predicate(message[name])
+               for name in names)
+
+
+def _string_list(value):
+    return isinstance(value, list) and all(isinstance(v, str) for v in value)
+
+
+def _byte_list(value):
+    return isinstance(value, list) and all(
+        isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 255
+        for v in value)
+
+
+def _valid_gatt_result(result):
+    if not isinstance(result, dict) or not _valid_bd_addr(result.get("mac")):
+        return False
+    if not _optional_fields(result, ("device_name", "error"),
+                            lambda v: isinstance(v, str)):
+        return False
+    services = result.get("services", [])
+    if not isinstance(services, list):
+        return False
+    for svc in services:
+        if not isinstance(svc, dict) or not isinstance(svc.get("uuid"), str):
+            return False
+        chars = svc.get("characteristics", [])
+        if not isinstance(chars, list):
+            return False
+        for char in chars:
+            if (not isinstance(char, dict)
+                    or not isinstance(char.get("uuid"), str)
+                    or not _string_list(char.get("flags", []))
+                    or not _optional_fields(char, ("value", "value_str"),
+                                            lambda v: isinstance(v, str))):
+                return False
+    return True
+
+
+def _valid_scan_result(result):
+    if not isinstance(result, dict) or not _valid_bd_addr(result.get("mac")):
+        return False
+    # Keep display dates representable and radio powers within signed octets.
+    if (not _optional_fields(result, ("name",), lambda v: isinstance(v, str))
+            or not _optional_fields(result, ("timestamp",),
+                                    lambda v: _finite_number(v) and 0 <= v <= 8.64e12)
+            or not _optional_fields(result, ("rssi", "tx_power"),
+                                    lambda v: _finite_number(v) and -128 <= v <= 127)
+            or not _string_list(result.get("service_uuids", []))):
+        return False
+    appearance = result.get("appearance")
+    if appearance is not None and (not isinstance(appearance, int)
+            or isinstance(appearance, bool) or not 0 <= appearance <= 65535):
+        return False
+    for key in ("manufacturer_data", "service_data"):
+        values = result.get(key)
+        if values is None:
+            continue
+        if not isinstance(values, dict) or not all(_byte_list(v) for v in values.values()):
+            return False
+        if key == "manufacturer_data":
+            if any(not k.isdecimal() or not 0 <= int(k) <= 65535 for k in values):
+                return False
+    return True
+
+
+def _valid_heartbeat(message):
+    if not _optional_fields(message, ("sensor_id", "sdr"), lambda v: isinstance(v, str)):
+        return False
+    if not _optional_fields(message, ("center_freq", "channels", "squelch", "pkt_rate",
+                                     "crc_pct", "uptime", "total_pkts"), _finite_number):
+        return False
+    gain = message.get("gain")
+    if gain is not None and not _finite_number(gain):
+        if not isinstance(gain, dict) or not _optional_fields(
+                gain, ("value", "lna", "vga"), _finite_number):
+            return False
+    gps = message.get("gps")
+    return gps is None or (isinstance(gps, list) and len(gps) >= 2
+                          and all(_finite_number(v) for v in gps)
+                          and -90 <= gps[0] <= 90 and -180 <= gps[1] <= 180)
+
+
+def _process_control_message(frames):
+    if len(frames) < 2:
+        return
+    msg = _load_json(frames[-1])
+    if not isinstance(msg, dict):
+        return
+    if msg.get("type") == "heartbeat" and _valid_heartbeat(msg):
+        sensor_id = msg.get("sensor_id", frames[0].decode("utf-8", "replace"))
+        if isinstance(sensor_id, str) and sensor_id:
+            state.update_sensor_c2(sensor_id, msg)
+
+
 def _process_gatt_message(frames):
     """Process a gatt: topic ZMQ message and store results in device state."""
     # Expected frames: [b"gatt:", sensor_id_bytes, json_payload]
@@ -2639,13 +2762,13 @@ def _process_gatt_message(frames):
         return
     try:
         payload = frames[-1]
-        result = json.loads(payload)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+        result = _load_json(payload)
+    except (ValueError, UnicodeDecodeError):
         return
 
-    mac = result.get("mac", "").lower()
-    if not mac:
+    if not _valid_gatt_result(result):
         return
+    mac = result["mac"].lower()
 
     with state.lock:
         if mac in state.devices:
@@ -2669,7 +2792,15 @@ def _process_smp_message(frames):
     # or: [b"smp:", json_payload] (no sensor_id)
     try:
         json_frame = frames[-1]  # last frame is always JSON
-        event = json.loads(json_frame)
+        event = _load_json(json_frame)
+        if not isinstance(event, dict):
+            return
+        if not _optional_fields(event, ("event", "aa", "reason", "method", "security",
+                                        "ltk", "irk", "addr_type"),
+                                lambda v: isinstance(v, (str, int))):
+            return
+        if "addr" in event and not _valid_bd_addr(event["addr"]):
+            return
         event_type = event.get("event", "unknown")
         aa = event.get("aa", "?")
 
@@ -2707,8 +2838,8 @@ def _process_smp_message(frames):
             # Keep last 100 events
             if len(_process_smp_message.state.smp_events) > 100:
                 _process_smp_message.state.smp_events = _process_smp_message.state.smp_events[-100:]
-    except (json.JSONDecodeError, IndexError) as e:
-        print(f"  SMP: failed to parse message: {e}", file=sys.stderr)
+    except (ValueError, IndexError, TypeError) as error:
+        print(f"  SMP: malformed message ignored ({type(error).__name__})", file=sys.stderr)
 
 
 def _process_scan_message(frames):
@@ -2719,20 +2850,22 @@ def _process_scan_message(frames):
         return
     try:
         payload = frames[-1]
-        result = json.loads(payload)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+        result = _load_json(payload)
+    except (ValueError, UnicodeDecodeError):
         return
 
-    mac = result.get("mac", "").lower()
-    if not mac:
+    if not _valid_scan_result(result):
         return
+    mac = result["mac"].lower()
 
     # Extract sensor_id from multipart frames (same pattern as gatt:)
     sensor_id = None
     if len(frames) >= 3:
         sensor_id = frames[1].decode("utf-8", errors="replace")
 
-    now = result.get("timestamp", time.time())
+    now = result.get("timestamp")
+    if now is None:
+        now = time.time()
     name = result.get("name")
     rssi = result.get("rssi")
     appearance = result.get("appearance")
@@ -2830,6 +2963,10 @@ def _process_scan_message(frames):
                 "pkts": 0,
                 "crc_ok": 0,
                 "crc_bad": 0,
+                "chans": {},
+                "hec_ok": 0,
+                "ac_clean": 0,
+                "uap_verified": False,
                 "mac_type": "",
                 "name": name or "",
                 "mfr": fp.get("manufacturer", ""),
@@ -2889,21 +3026,25 @@ def zmq_receiver(endpoints, server_key_path, pcap_file, use_gps):
         except zmq.ZMQError:
             break
 
-        # Handle gatt: topic messages (frame 0 = topic, frame 1 = sensor_id,
-        # frame 2 = JSON payload)
-        if frames and frames[0] == b"gatt:":
-            _process_gatt_message(frames)
-            continue
+        try:
+            # Handle gatt: topic messages (frame 0 = topic, frame 1 = sensor_id,
+            # frame 2 = JSON payload)
+            if frames and frames[0] == b"gatt:":
+                _process_gatt_message(frames)
+                continue
 
-        if frames and frames[0] == b"scan:":
-            _process_scan_message(frames)
-            continue
+            if frames and frames[0] == b"scan:":
+                _process_scan_message(frames)
+                continue
 
-        if frames and frames[0] == b"smp:":
-            _process_smp_message(frames)
-            continue
+            if frames and frames[0] == b"smp:":
+                _process_smp_message(frames)
+                continue
 
-        _process_zmq_message(frames, pcap_file, use_gps)
+            _process_zmq_message(frames, pcap_file, use_gps)
+        except (ValueError, TypeError, KeyError, IndexError, AttributeError,
+                OverflowError, RecursionError, struct.error) as error:
+            print(f"  SUB: malformed message ignored ({type(error).__name__})", file=sys.stderr)
 
     sub.close()
     ctx.term()
@@ -2959,20 +3100,11 @@ def control_router_thread(data_port, server_key_path):
         if router in ready:
             try:
                 frames = router.recv_multipart(zmq.NOBLOCK)
-                if len(frames) >= 2:
-                    identity = frames[0]
-                    payload = frames[-1]
-                    try:
-                        msg = json.loads(payload)
-                        msg_type = msg.get("type", "")
-                        if msg_type == "heartbeat":
-                            sensor_id = msg.get("sensor_id",
-                                                identity.decode("utf-8", "replace"))
-                            state.update_sensor_c2(sensor_id, msg)
-                        elif msg_type == "response":
-                            pass  # could log C2 responses
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        pass
+                try:
+                    _process_control_message(frames)
+                except (ValueError, TypeError, KeyError, IndexError, AttributeError,
+                        OverflowError, RecursionError) as error:
+                    print(f"  C2: malformed message ignored ({type(error).__name__})", file=sys.stderr)
             except zmq.Again:
                 pass
 

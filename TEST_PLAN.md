@@ -172,6 +172,21 @@
 - [ ] L2CAP flood via API: `POST /api/c2/l2cap_flood`
 - [ ] Multi-sensor management (multiple blue-dragon instances)
 
+### Malformed-message handling
+
+- [ ] Run the mocked SUB/ROUTER survival tests in
+  `tests/test_dashboard_ingestion.py`; malformed frames must not prevent a
+  later valid message or delivery of a queued command.
+- [ ] Run `tests/test_scan_packet_transition.py`: a scan-first device must
+  accept later SDR packets, update per-sensor RSSI, persist packet/channel
+  counts to a temporary database and deliver watch alerts.
+- [ ] Check GATT shapes on a known device, out-of-range heartbeat GPS and
+  invalid SMP addresses; each rejection needs a valid positive control.
+- [ ] Run `tests/test_json_intake.py`: reject non-finite numbers, including
+  unknown nested fields, without retaining invalid SSE/API state.
+- [ ] Verify malformed then valid messages over live ZMQ sockets with a
+  validation dashboard using `--no-db`. Mocked sockets do not qualify this.
+
 ---
 
 ## Cross-Device Loopback Tests (Verified)
