@@ -174,32 +174,59 @@
 
 ### Malformed-message handling
 
-- [ ] Run the mocked SUB/ROUTER survival tests in
-  `tests/test_dashboard_ingestion.py`; malformed frames must not prevent a
-  later valid message or delivery of a queued command.
-- [ ] Run `tests/test_scan_packet_transition.py`: a scan-first device must
-  accept later SDR packets, update per-sensor RSSI, persist packet/channel
-  counts to a temporary database and deliver watch alerts.
-- [ ] Check GATT shapes on a known device, out-of-range heartbeat GPS and
-  invalid SMP addresses; each rejection needs a valid positive control.
-- [ ] Run `tests/test_json_intake.py`: reject non-finite numbers, including
-  unknown nested fields, without retaining invalid SSE/API state.
-- [ ] Verify malformed then valid messages over live ZMQ sockets with a
-  validation dashboard using `--no-db`. Mocked sockets do not qualify this.
+- [x] Dashboard unit tests: `python3 -m unittest discover -s tests -p 'test_*.py' -v`
+  - 27 passed when recorded (dashboard tests only; later test files raise the total):
+    mocked SUB/ROUTER survival, queued commands, GATT/GPS/SMP validation with
+    positive controls, and nested non-finite JSON rejection.
+  - A scan-created device accepts two later SDR packets, updating per-sensor
+    RSSI, temporary SQLite packet/channel counts and watch alerts
+    (`tests/test_scan_packet_transition.py`).
+- [x] Malformed then valid input over real loopback ZMQ:
+  dashboard `--no-db --alert-file FILE --alert-cooldown 0`.
+  - Temporary synthetic XPUB/DEALER peer (not committed); two valid packets
+    after the malformed input raised two watch alerts.
+  - Production SUB/ROUTER, HTTP/SSE and queued `get_status` remain usable.
+    A test wrapper restricts HTTP/ROUTER binds; there is no CLI bind option.
 
 ### Request and Browser Validation
 
-- [ ] Every upstream POST route rejects malformed/non-object bodies and invalid
-      numeric fields with HTTP 400, with command dispatch stubbed.
-- [ ] JSON with charset works; form/plain POSTs get 415; rewritten proxy Host
-      works; cross-origin JSON preflight authorizes no request.
-- [ ] On untrustworthy HTTP, header-absent same-origin JSON works, simple
-      cross-origin POSTs fail and JSON preflight queues no command.
-- [ ] Fetch Metadata rejects cross-site/same-site separately from LAN HTTP.
-- [ ] Real browser DOM renders hostile RF/sensor labels as text in map, Nodes
-      and detail views; watch, gain/squelch, restart and GATT query still work
-      against stub sensors with `--no-db`.
-- [ ] Live sensor deployment qualification.
+- [x] All POST routes: malformed bodies/fields return HTTP 400; dispatch stubbed.
+- [x] JSON charset and rewritten Host work; form/plain POSTs return 415; no CORS.
+- [x] Untrustworthy HTTP: header-absent same-origin JSON works; cross-origin
+  simple POSTs fail and JSON preflight queues no command.
+- [x] Fetch Metadata rejects cross-site/same-site separately from LAN HTTP.
+- [x] Headless Chrome against dashboard `main()` with `--no-db --gps`.
+  - Temporary harness (not committed): ZMQ module and receivers disabled,
+    synthetic state seeded, stand-in alert manager, C2 commands logged and
+    test-only routes; endpoint `inproc://stub`.
+  - Hostile labels remain text in map, Nodes and detail views. Watch updates
+    stand-in watch set; GATT query, gain/squelch and restart reach an
+    inert command sink. Leaflet loads from unpkg.
+  - Browser and live HTTP security checks ran before the socket checks against
+    an identical dashboard source file (same SHA-256); they were not rerun.
+- [x] Synthetic VITA 49 through dashboard `main()`, debug build with ZMQ:
+  ```sh
+  # Equivalent build; recorded binary used Rust 1.87 and a local Cargo.lock.
+  cargo build --no-default-features --features zmq -p blue-dragon
+  # Terminal 1: start the dashboard first.
+  python3 tools/zmq_web_dashboard.py tcp://127.0.0.1:PUBLISH_PORT \
+    --port HTTP_PORT --no-db
+  # Terminal 2: start the sensor.
+  target/debug/blue-dragon -l -i vita49:127.0.0.1:PORT -C 4 -c 2426 --no-gpu \
+    --check-crc --stats --zmq tcp://127.0.0.1:PUBLISH_PORT \
+    --sensor-id SENSOR_ID -w sensor.pcap
+  ```
+  - Command templates: ports and sensor ID are placeholders. The temporary
+    IQ generator and VITA 49 sender are not in the repository. A test wrapper
+    calls dashboard `main()` with these arguments and restricts HTTP/ROUTER
+    binds to loopback; the CLI alone does not restrict those binds.
+  - 12 CRC-valid packets reach HTTP/SSE; `get_status` triggers a heartbeat
+    before the periodic timer. Both processes stop cleanly.
+  - The tested dashboard used the browser-hardening changes. The sensor's Rust sources match
+    upstream except the PCAP file-header snaplen in `crates/output/src/pcap.rs`
+    from the separate capture change, which affects only `-w` output.
+- [ ] Live SDR RF acquisition through the dashboard.
+- [ ] Cross-host ZMQ/dashboard deployment and GPS hardware.
 
 ---
 
